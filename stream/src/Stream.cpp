@@ -34,6 +34,7 @@
 
 #define LOG_TAG "PAL: Stream"
 #include <semaphore.h>
+#include <cutils/properties.h>
 #include "Stream.h"
 #include "Session.h"
 #include "ResourceManager.h"
@@ -153,10 +154,23 @@ Stream* Stream::create(struct pal_stream_attributes *sAttr, struct pal_device *d
         if (sAttr->type == PAL_STREAM_ULTRASOUND ||
             sAttr->type == PAL_STREAM_SENSOR_PCM_RENDERER) {
             if (i == 0) { // first assign output device
-                if (rm->IsVirtualPortForUPDEnabled())
-                    dAttr[i].id = PAL_DEVICE_OUT_ULTRASOUND;
-                else
-                    dAttr[i].id = PAL_DEVICE_OUT_ULTRASOUND_DEDICATED;
+                char vendor_sku[PROPERTY_VALUE_MAX] = {'\0'};
+                if (property_get("ro.boot.product.vendor.sku", vendor_sku, "") <= 0) {
+                    PAL_ERR(LOG_TAG, "Failed to get vendor_sku property");
+                }
+                if((!strcmp(vendor_sku , "ravelin")) || (!strcmp(vendor_sku, "bourtzi"))) {
+                    if (rm->IsDedicatedBEForUPDEnabled()) {
+                        dAttr[i].id = PAL_DEVICE_OUT_ULTRASOUND;
+                    }
+                    else {
+                        dAttr[i].id = PAL_DEVICE_OUT_HANDSET;
+                    }
+                } else {
+                    if (rm->IsVirtualPortForUPDEnabled())
+                        dAttr[i].id = PAL_DEVICE_OUT_ULTRASOUND;
+                    else
+                        dAttr[i].id = PAL_DEVICE_OUT_ULTRASOUND_DEDICATED;
+                }
             } else { // then assign input device
                 dAttr[i].id = PAL_DEVICE_IN_ULTRASOUND_MIC;
             }
@@ -1071,6 +1085,15 @@ int32_t Stream::connectStreamDevice_l(Stream* streamHandle, struct pal_device *d
         if (0 != status) {
             PAL_ERR(LOG_TAG, "device %d name %s, start failed with status %d",
                 dev->getSndDeviceId(), dev->getPALDeviceName().c_str(), status);
+            if (status == -EAGAIN && rm->isBtA2dpDevice((pal_device_id_t)dev->getSndDeviceId())) {
+                if (rm->isOutputDevId((pal_device_id_t)dev->getSndDeviceId())) {
+                    suspendedOutDevIds.clear();
+                    suspendedOutDevIds.push_back((pal_device_id_t)dev->getSndDeviceId());
+                } else if (rm->isInputDevId((pal_device_id_t)dev->getSndDeviceId())) {
+                    suspendedInDevIds.clear();
+                    suspendedInDevIds.push_back((pal_device_id_t)dev->getSndDeviceId());
+                }
+            }
             rm->unlockGraph();
             goto dev_close;
         }
@@ -1873,7 +1896,7 @@ void Stream::removemDevice(int palDevId)
     for (dIter = mDevices.begin(); dIter != mDevices.end();) {
         devId = (*dIter)->getSndDeviceId();
         if (devId == palDevId) {
-            mDevices.erase(dIter);
+            dIter = mDevices.erase(dIter);
         } else {
             dIter++;
         }
@@ -1985,4 +2008,40 @@ int32_t Stream::getCustomParam(custom_payload_uc_info_t* uc_info, std::string pa
     mStreamMutex.unlock();
 
     return status;
+}
+
+int32_t Stream::handleDeviceStartFailure(int32_t devStatus, std::shared_ptr<Device> dev, bool& disconnect) {
+    if (devStatus == -EAGAIN &&
+        rm->isBtA2dpDevice((pal_device_id_t) dev->getSndDeviceId())) {
+        PAL_DBG(LOG_TAG, "BT dev is not ready, retry to switch backup dev");
+        devStatus = rm->checkAndHandleBTNotReady(this);
+    }
+
+    if (0 != devStatus) {
+        PAL_ERR(LOG_TAG,
+                "failed to start dev, disconect session[stream type:%d] and device[%d].",
+                        mStreamAttr->type, dev->getSndDeviceId());
+        auto it = std::find(mDevices.begin(), mDevices.end(), dev);
+        if (it == mDevices.end()) {
+            // already removed by a lower-level failure path, avoid double close
+            PAL_DBG(LOG_TAG, "device %d already removed from mDevices, skip re-close",
+                    dev->getSndDeviceId());
+            disconnect = true;
+            return devStatus;
+        }
+        rm->lockGraph();
+        int32_t rc = session->disconnectSessionDevice(this,
+                                    mStreamAttr->type, dev);
+        if (0 != rc) {
+            PAL_ERR(LOG_TAG, "disconnectSessionDevice failed:%d", rc);
+        }
+        rc = dev->close();
+        if (0 != rc) {
+            PAL_ERR(LOG_TAG, "device close failed with status %d", rc);
+        }
+        mDevices.erase(it);
+        rm->unlockGraph();
+        disconnect = true;
+    }
+    return devStatus;
 }

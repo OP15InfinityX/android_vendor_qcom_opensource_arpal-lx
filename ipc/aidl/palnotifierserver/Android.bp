@@ -3,11 +3,6 @@ cc_library_shared {
     owner: "qti",
     vendor: true,
 
-    // This product uses the OxygenOS 16.0.8 prebuilt (paleventnotifier AIDL V2).
-    // Do not analyze the unused source implementation's V3 dependency together
-    // with that preferred prebuilt. The stock library remains enabled.
-    enabled: false,
-
     tidy: true,
 
     cflags: [
@@ -41,4 +36,6 @@ cc_library_shared {
         "libaidlcommonsupport",
         "libpalaidltypeconverter",
     ],
+
+    vintf_fragments: ["Manifest_IPALEventNotifier.xml"],
 }

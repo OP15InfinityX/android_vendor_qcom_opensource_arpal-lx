@@ -2287,8 +2287,10 @@ int SessionAlsaPcm::setParamWithTag(Stream *streamHandle, int tagId, uint32_t pa
                 goto exit;
             }
             if (0 != status) {
-                PAL_ERR(LOG_TAG, "Failed to get tag info %x, dir: %d (%d)", tagId,
-                       sAttr.direction, status);
+                PAL_INFO(LOG_TAG,
+                    "Failed to get module tag info %x, dir: %d (%d). "
+                    "Volume module may not be present in this topology, ignoring as non-fatal.",
+                    tagId, sAttr.direction, status);
                 status = 0;
                 goto exit;
             }
@@ -2502,6 +2504,8 @@ int SessionAlsaPcm::setParamWithTag(Stream *streamHandle, int tagId, uint32_t pa
                         if (status)
                             PAL_ERR(LOG_TAG, "setMixerParam for haptics PCM Failed\n");
                     }
+                    if (paramData)
+                        builder->freeCustomPayload(&paramData, &paramSize);
                 }
                 builder->payloadHapticsDevPConfig(&paramData, &paramSize,
                            miid, PARAM_ID_HAPTICS_WAVE_DESIGNER_CFG_V2,(void *)hpCnfg);
@@ -2511,6 +2515,8 @@ int SessionAlsaPcm::setParamWithTag(Stream *streamHandle, int tagId, uint32_t pa
                     if (status)
                        PAL_ERR(LOG_TAG, "setMixerParam failed for haptics Wave\n");
                 }
+                if (paramData)
+                    builder->freeCustomPayload(&paramData, &paramSize);
             }
             free(hpCnfg->buffer_ptr);
             hpCnfg->buffer_ptr = NULL;

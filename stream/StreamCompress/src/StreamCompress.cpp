@@ -63,13 +63,18 @@
 extern "C" Stream* CreateCompressStream(const struct pal_stream_attributes *sattr, struct pal_device *dattr,
                                const uint32_t no_of_devices, const struct modifier_kv *modifiers,
                                const uint32_t no_of_modifiers, const std::shared_ptr<ResourceManager> rm) {
-    try {
-        return new StreamCompress(sattr, dattr, no_of_devices, modifiers, no_of_modifiers, rm);
-    } catch (const std::exception& e) {
-         PAL_ERR(LOG_TAG, "Stream create failed for stream type %s: %s",
-                streamNameLUT.at(sattr->type).c_str(), e.what());
-        return nullptr;
+    StreamCompress* stream = new(std::nothrow) StreamCompress(sattr, dattr, no_of_devices,
+                        modifiers, no_of_modifiers, rm);
+    if (stream) {
+        if (stream->isInitialized()) {
+            return stream;
+        } else {
+            delete stream;
+        }
     }
+    PAL_ERR(LOG_TAG, "Stream create failed for stream type %s:",
+                    streamNameLUT.at(sattr->type).c_str());
+    return nullptr;
 }
 
 StreamCompress::StreamCompress(const struct pal_stream_attributes *sattr, struct pal_device *dattr,
@@ -103,7 +108,7 @@ StreamCompress::StreamCompress(const struct pal_stream_attributes *sattr, struct
     if (!mVolumeData) {
         PAL_ERR(LOG_TAG, "malloc for volume data failed");
         mStreamMutex.unlock();
-        throw std::runtime_error("failed to malloc for volume data");
+        return;
     }
     mVolumeData->no_of_volpair = 1;
     mVolumeData->volume_pair[0].channel_mask = 0x03;
@@ -115,7 +120,7 @@ StreamCompress::StreamCompress(const struct pal_stream_attributes *sattr, struct
         free(mVolumeData);
         mVolumeData = NULL;
         mStreamMutex.unlock();
-        throw std::runtime_error("failed to malloc for stream attributes");
+        return;
     }
     ar_mem_cpy(mStreamAttr, sizeof(pal_stream_attributes), sattr, sizeof(pal_stream_attributes));
     PAL_VERBOSE(LOG_TAG, "Create new compress session");
@@ -128,7 +133,7 @@ StreamCompress::StreamCompress(const struct pal_stream_attributes *sattr, struct
         free(mVolumeData);
         mVolumeData = NULL;
         mStreamMutex.unlock();
-        throw std::runtime_error("failed to create session object");
+        return;
     }
 
     PAL_VERBOSE(LOG_TAG,"Create new Devices with no_of_devices - %d", no_of_devices);
@@ -163,7 +168,7 @@ StreamCompress::StreamCompress(const struct pal_stream_attributes *sattr, struct
             delete session;
             session = nullptr;
             mStreamMutex.unlock();
-            throw std::runtime_error("failed to create device object");
+            return;
         }
         dev->insertStreamDeviceAttr(&dattr[i], this);
         mPalDevices.push_back(dev);
@@ -184,6 +189,7 @@ StreamCompress::StreamCompress(const struct pal_stream_attributes *sattr, struct
         mDevices.push_back(dev);
         dev = nullptr;
     }
+    mInitialized = true;
     mStreamMutex.unlock();
     PAL_VERBOSE(LOG_TAG,"exit, state %d", currentState);
 }
@@ -409,9 +415,8 @@ exit:
 int32_t StreamCompress::start()
 {
     int32_t status = 0, devStatus = 0, cachedStatus = 0;
-    int32_t tmp = 0;
+    bool disconnect = false;
     bool a2dpSuspend = false;
-
     mStreamMutex.lock();
 
     PAL_VERBOSE(LOG_TAG,"Enter, session handle - %p mStreamAttr->direction - %d",
@@ -424,26 +429,37 @@ int32_t StreamCompress::start()
     }
 
     if (currentState == STREAM_INIT || currentState == STREAM_STOPPED) {
+        /* Post-start shared-BE convergence for Compress playback:
+        * iterate over active devices and re-run RM device evaluation
+        * after stream start, to resolve routing mismatches caused by
+        * concurrent route decisions and incomplete first-pass convergence.
+        */
+        if (!mDevices.empty()) {
+            for (int32_t i = 0; i < mDevices.size(); ++i) {
+                std::shared_ptr<Device> dev = mDevices[i];
+                struct pal_device devAttr = {};
+                if (dev->getDeviceAttributes(&devAttr, this)) {
+                    PAL_INFO(LOG_TAG, "post-start convergence: failed to get attr for dev %d",
+                             dev->getSndDeviceId());
+                    continue;
+                }
+                mStreamMutex.unlock();
+                if (rm->updateDeviceConfig(&dev, &devAttr, mStreamAttr)) {
+                    PAL_INFO(LOG_TAG, "post-start convergence triggered for dev %d",
+                             dev->getSndDeviceId());
+                }
+                mStreamMutex.lock();
+            }
+        }
         switch (mStreamAttr->direction) {
         case PAL_AUDIO_OUTPUT:
             PAL_VERBOSE(LOG_TAG, "Inside PAL_AUDIO_OUTPUT device count - %zu", mDevices.size());
-            // handle scenario where BT device is not ready
-            if (rm->IsDummyDevEnabled()) {
-                status = rm->handleBTDeviceNotReadyToDummy(this, a2dpSuspend);
-            } else {
-                status = rm->handleBTDeviceNotReady(this, a2dpSuspend);
-            }
-            if (0 != status)
-                goto exit;
-
-            rm->lockGraph();
             /* Any device start success will be treated as positive status.
              * This allows stream be played even if one of devices failed to start.
              */
             status = -EINVAL;
             if (!mDevices.size()) {
                 PAL_ERR(LOG_TAG, "No Rx device available to start the usecase");
-                rm->unlockGraph();
                 goto exit;
             }
 
@@ -452,30 +468,32 @@ int32_t StreamCompress::start()
                 if (devStatus == 0) {
                     status = 0;
                 } else {
-                    cachedStatus = devStatus;
-
-                    tmp = session->disconnectSessionDevice(this, mStreamAttr->type, mDevices[i]);
-                    if (0 != tmp) {
-                        PAL_ERR(LOG_TAG, "disconnectSessionDevice failed:%d", tmp);
+                    disconnect = false;
+                    pal_device_id_t failedDevId = (pal_device_id_t) mDevices[i]->getSndDeviceId();
+                    std::shared_ptr<Device> failedDev = mDevices[i];
+                    devStatus = handleDeviceStartFailure(devStatus, mDevices[i], disconnect);
+                    if (devStatus == 0) {
+                        status = 0;
                     }
-
-                    tmp = mDevices[i]->close();
-                    if (0 != tmp) {
-                        PAL_ERR(LOG_TAG, "device close failed with status %d", tmp);
+                    if (devStatus && rm->isBtA2dpDevice(failedDevId) &&
+                        !rm->isDeviceReady(failedDevId) &&
+                        !rm->IsDummyDevEnabled()) {
+                            a2dpSuspend = true;
                     }
-                    mDevices.erase(mDevices.begin() + i);
-                    i--;
+                    PAL_DBG(LOG_TAG, "disconnect: %d", disconnect);
+                    // retry may mutate mDevices even on success; re-sync via find
+                    bool devicesMutated = disconnect ||
+                        std::find(mDevices.begin(), mDevices.end(), failedDev) == mDevices.end();
+                    i = devicesMutated ? i - 1 : i;
                 }
             }
             if (0 != status) {
-                status = cachedStatus;
                 PAL_ERR(LOG_TAG, "Rx device start failed with status %d", status);
-                rm->unlockGraph();
                 goto exit;
             } else {
                 PAL_VERBOSE(LOG_TAG, "devices started successfully");
             }
-
+            rm->lockGraph();
             status = session->prepare(this);
             if (0 != status) {
                 PAL_ERR(LOG_TAG,"Rx session prepare is failed with status %d",status);
@@ -514,8 +532,6 @@ int32_t StreamCompress::start()
         case PAL_AUDIO_INPUT:
             PAL_VERBOSE(LOG_TAG, "Inside PAL_AUDIO_INPUT device count - %zu", mDevices.size());
 
-            rm->lockGraph();
-
             for (int32_t i = 0; i < mDevices.size(); i++) {
                 PAL_ERR(LOG_TAG, "device %d name %s, going to start",
                         mDevices[i]->getSndDeviceId(),
@@ -524,12 +540,19 @@ int32_t StreamCompress::start()
                 if (0 != status) {
                     PAL_ERR(LOG_TAG, "Tx device start failed with status %d",
                             status);
-                    rm->unlockGraph();
-                    goto exit;
+                    disconnect = false;
+                    std::shared_ptr<Device> failedDev = mDevices[i];
+                    status = handleDeviceStartFailure(status, mDevices[i], disconnect);
+                    if (0 != status) {
+                        goto exit;
+                    }
+                    bool devicesMutated = disconnect ||
+                        std::find(mDevices.begin(), mDevices.end(), failedDev) == mDevices.end();
+                    i = devicesMutated ? i - 1 : i;
                 }
             }
             PAL_VERBOSE(LOG_TAG,"devices started successfully");
-
+            rm->lockGraph();
             status = session->prepare(this);
             if (0 != status) {
                 PAL_ERR(LOG_TAG, "Tx session prepare is failed with status %d",
@@ -938,6 +961,17 @@ int32_t StreamCompress::resume_l()
     if (0 != status) {
        PAL_ERR(LOG_TAG,"session resume for pause failed with status %d",status);
        goto exit;
+    }
+
+    if (mStreamAttr->direction == PAL_AUDIO_OUTPUT) {
+        pal_param_device_rotation_t rotation;
+        rotation.rotation_type = rm->getOrientation() == ORIENTATION_270 ?
+                                PAL_SPEAKER_ROTATION_RL : PAL_SPEAKER_ROTATION_LR;
+        status = session->setParameters(this, PAL_PARAM_ID_DEVICE_ROTATION, &rotation);
+        if (0 != status) {
+            PAL_ERR(LOG_TAG, "session setParameters for rotation failed with status %d",
+                    status);
+        }
     }
     isPaused = false;
 

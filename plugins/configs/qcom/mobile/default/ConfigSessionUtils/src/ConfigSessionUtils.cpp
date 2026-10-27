@@ -47,6 +47,7 @@
 #include "SessionAlsaPcm.h"
 #include "SessionAlsaUtils.h"
 #include "ConfigSessionUtils.h"
+#include "SessionAR.h"
 #include "apm_api.h"
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -66,6 +67,7 @@
 
 #define BOLERO_PROC_INTF    "/proc/lpass_cdc_reginfo/lpass_cdc_regdump"
 #define WCD939X_PROC_INTF   "/proc/wcd939x_reginfo/wcd939x_regdump"
+#define WCD9378_PROC_INTF   "/proc/wcd9378_reginfo/wcd9378_regdump"
 #define WSA884X_1_PROC_INTF "/proc/wsa884x_reginfo_1/wsa884x_regdump"
 #define WSA884X_2_PROC_INTF "/proc/wsa884x_reginfo_2/wsa884x_regdump"
 #define WSA883X_1_PROC_INTF "/proc/wsa883x_reginfo_1/wsa883x_regdump"
@@ -79,12 +81,14 @@
 #define SILENCE_EVENT_INFO DUMP_OUT_PATH "silence_event_info"
 #define BOLERO_REGDUMP_OUT_FILE          "lpass_cdc_regdump"
 #define WCD939X_REGDUMP_OUT_FILE         "wcd939x_regdump"
+#define WCD9378_REGDUMP_OUT_FILE         "wcd9378_regdump"
 #define VA_SWR_REGDUMP_OUT_FILE          "va_swr_regdump"
 
 #define KMSG_OUT_FILE              DUMP_OUT_PATH KMSG_FILE TIMESTAMP_FORMAT_STRING
 #define SILENCE_EVENT_INFO         DUMP_OUT_PATH "silence_event_info" TIMESTAMP_FORMAT_STRING
 #define BOLERO_REGDUMP_OUT_PATH    DUMP_OUT_PATH BOLERO_REGDUMP_OUT_FILE TIMESTAMP_FORMAT_STRING
 #define WCD939X_REGDUMP_OUT_PATH   DUMP_OUT_PATH WCD939X_REGDUMP_OUT_FILE TIMESTAMP_FORMAT_STRING
+#define WCD9378_REGDUMP_OUT_PATH   DUMP_OUT_PATH WCD9378_REGDUMP_OUT_FILE TIMESTAMP_FORMAT_STRING
 #define VA_SWR_REGDUM_OUT_PATH     DUMP_OUT_PATH VA_SWR_REGDUMP_OUT_FILE TIMESTAMP_FORMAT_STRING
 
 bool silenceEventRegistered = false;
@@ -969,6 +973,7 @@ int32_t pluginConfigSetParam(Stream* s, void* pluginPayload)
     switch (paramId) {
         case PAL_PARAM_ID_DEVICE_ROTATION:
         {
+            bool doDevPPMute = false;
             status = s->getStreamAttributes(&sAttr);
             if (status) {
                 PAL_ERR(LOG_TAG, "could not get stream attributes\n");
@@ -991,8 +996,31 @@ int32_t pluginConfigSetParam(Stream* s, void* pluginPayload)
             if (sAttr.type == PAL_STREAM_LOW_LATENCY ||
                     sAttr.type == PAL_STREAM_ULTRA_LOW_LATENCY) {
                     setConfigStatus = session->setConfig(s, MODULE, MUTE_TAG);
-            } else {
-                setConfigStatus = session->setConfig(s, MODULE, DEVICEPP_MUTE);
+            }  else if (PAL_AUDIO_OUTPUT == sAttr.direction) {
+                /* Need to check if there is a valid module available
+                 * for DEVICEPP_MUTE to avoid false negative failing
+                 * setConfig message.*/
+                status = s->getAssociatedDevices(associatedDevices);
+                if (0 != status) {
+                    PAL_ERR(LOG_TAG, "getAssociatedDevices Failed\n");
+                    goto exit;
+                }
+                for (int i = 0; i < associatedDevices.size(); i++) {
+                    status = associatedDevices[i]->getDeviceAttributes(&dAttr);
+                    if (0 != status) {
+                        PAL_ERR(LOG_TAG, "getDeviceAttributes Failed\n");
+                        break;
+                    }
+                    if ((PAL_DEVICE_OUT_SPEAKER == dAttr.id) &&
+                        (2 == dAttr.config.ch_info.channels) &&
+                        (strcmp(dAttr.custom_config.custom_key, "mspp") != 0)) {
+                        doDevPPMute = true;
+                        break;
+                    }
+                }
+                if (doDevPPMute) {
+                    setConfigStatus = session->setConfig(s, MODULE, DEVICEPP_MUTE);
+                }
             }
             if (setConfigStatus) {
                 PAL_INFO(LOG_TAG, "DevicePP Mute failed");
@@ -1010,9 +1038,9 @@ int32_t pluginConfigSetParam(Stream* s, void* pluginPayload)
 
             // mStreamMutex.lock();
             if (sAttr.type == PAL_STREAM_LOW_LATENCY ||
-                sAttr.type == PAL_STREAM_ULTRA_LOW_LATENCY) {
-                setConfigStatus = session->setConfig(s, MODULE, UNMUTE_TAG);
-            } else {
+                    sAttr.type == PAL_STREAM_ULTRA_LOW_LATENCY) {
+                    setConfigStatus = session->setConfig(s, MODULE, UNMUTE_TAG);
+            } else if (doDevPPMute) {
                 setConfigStatus = session->setConfig(s, MODULE, DEVICEPP_UNMUTE);
             }
             if (setConfigStatus) {
@@ -1049,6 +1077,9 @@ int enableSilenceDetection(const std::shared_ptr<ResourceManager> rm,
     struct apm_module_param_data_t* header = NULL;
     param_id_silence_detection_t *silence_detection_cfg = NULL;
     struct agm_event_reg_cfg event_cfg = {};
+    SessionAR *arSession = nullptr;
+
+    PAL_INFO(LOG_TAG, "Enter.");
 
     if (silenceEventRegistered == true)
         goto silence_ev_setup_done;
@@ -1068,26 +1099,47 @@ int enableSilenceDetection(const std::shared_ptr<ResourceManager> rm,
     }
 
     PAL_INFO(LOG_TAG, "Registered for Silence Detection Event\n");
+    arSession = reinterpret_cast<SessionAR *>(cookie);
+    if (arSession) {
+        status = arSession->registerArEvent(EVENT_ID_SILENCE_DETECTION,
+                                        handleSilenceDetectionCb,
+                                        (uint64_t)arSession,
+                                        devIds, true);
+        if (status != 0) {
+            PAL_ERR(LOG_TAG, "Failed to register with SessionAR");
+        }
+    } else {
+        PAL_ERR(LOG_TAG, "Invalid session handle (cookie), cannot register AR event");
+        status = -EINVAL;
+    }
 
-    status = rm->registerMixerEventCallback(devIds, handleSilenceDetectionCb, cookie, true);
     if (status != 0) {
           PAL_ERR(LOG_TAG, "Failed to register DSP cb for silence detection Event");
           goto err_silence_ev_cb_reg;
     }
+
     PAL_INFO(LOG_TAG, "Registered CB for Silence Detection\n");
     silenceEventRegistered = true;
     PAL_INFO(LOG_TAG, "Silence Detection setup sucessfully \n");
 
     goto silence_ev_setup_done;
 
-err_silence_ev_setup:
-                rm->registerMixerEventCallback(devIds, handleSilenceDetectionCb,
-                                cookie, false);
 err_silence_ev_cb_reg:
+                if (arSession) {
+                    status = arSession->registerArEvent(EVENT_ID_SILENCE_DETECTION,
+                                        handleSilenceDetectionCb,
+                                        (uint64_t)arSession,
+                                        devIds, false);
+                    if (status != 0) {
+                        PAL_ERR(LOG_TAG, "Failed to register with SessionAR");
+                    }
+                }
+
                 event_cfg.is_register = 0;
                 status  = SessionAlsaUtils::registerMixerEvent(mixer, devIds.at(0),
                                intf_name, DEVICE_HW_ENDPOINT_TX,
                                 (void *)&event_cfg, sizeof(struct agm_event_reg_cfg));
+                return status;
 silence_ev_setup_done:
                 status = 0;
     return status;
@@ -1100,6 +1152,9 @@ int disableSilenceDetection(const std::shared_ptr<ResourceManager> rm,
 {
     int status = 0;
     struct agm_event_reg_cfg event_cfg = {};
+    SessionAR *arSession = reinterpret_cast<SessionAR *>(cookie);
+
+    PAL_INFO(LOG_TAG, "Enter.");
 
     event_cfg.event_id = EVENT_ID_SILENCE_DETECTION;
     event_cfg.event_config_payload_size = 0;
@@ -1114,10 +1169,15 @@ int disableSilenceDetection(const std::shared_ptr<ResourceManager> rm,
                  (void *)&event_cfg, sizeof(struct agm_event_reg_cfg));
     if (status)
         PAL_ERR(LOG_TAG, "Unable to deregister SILENCE DETECTION EVENT\n");
-
-    status = rm->registerMixerEventCallback(devIds, handleSilenceDetectionCb, cookie, false);
+    if (arSession) {
+        arSession->registerArEvent(EVENT_ID_SILENCE_DETECTION,
+                                        handleSilenceDetectionCb,
+                                        (uint64_t)arSession,
+                                        devIds, false);
+    }
     if (status != 0)
-        PAL_ERR(LOG_TAG, "Failed to deregister  silence detection Callback to rm");
+        PAL_ERR(LOG_TAG, "Failed to deregister silence detection Callback via SessionAR");
+
 
     silenceEventRegistered = false;
 
@@ -1286,6 +1346,13 @@ void handleSilenceDetectionCb(uint64_t hdl __unused, uint32_t event_id, void *ev
         strftime(out_file_name, MAX_DUMP_FILENAME_SIZE,
                         WCD939X_REGDUMP_OUT_PATH, timenow);
         dump_registers(WCD939X_PROC_INTF, out_file_name);
+
+        /*
+         * Read WCD9378  Registers
+         **/
+        strftime(out_file_name, MAX_DUMP_FILENAME_SIZE,
+                        WCD9378_REGDUMP_OUT_PATH, timenow);
+        dump_registers(WCD9378_PROC_INTF, out_file_name);
 
         /*
          * kernel msg (/dev/kmsg) read

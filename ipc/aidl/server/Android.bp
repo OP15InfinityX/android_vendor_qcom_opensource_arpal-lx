@@ -38,4 +38,6 @@ cc_library_shared {
         "libaidlcommonsupport",
         "libpalaidltypeconverter",
     ],
+
+    vintf_fragments: ["Manifest_IPAL.xml"],
 }

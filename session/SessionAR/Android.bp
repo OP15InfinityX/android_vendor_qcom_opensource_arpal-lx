@@ -45,7 +45,7 @@ cc_library_shared {
         "true": ["libarmemlog_headers"],
         default: [],
     }) + select(soong_config_variable("ANDROID", "target_board_platform"), {
-        "sun": [
+        "canoe": [
             "mink_headers",
             "peripheralstate_headers",
         ],
@@ -64,7 +64,7 @@ cc_library_shared {
         "libtinyalsa",
         "libtinycompress",
     ] + select(soong_config_variable("ANDROID", "target_board_platform"), {
-        "sun": ["libPeripheralStateUtils"],
+        "canoe": ["libPeripheralStateUtils"],
         default: [],
     }),
 }
